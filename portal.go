@@ -448,7 +448,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, channel *discordgo.Channel) e
 	}
 
 	creationContent := make(map[string]interface{})
-	if portal.Type == discordgo.ChannelTypeGuildCategory {
+	if portal.Type == discordgo.ChannelTypeGuildCategory || portal.Type == discordgo.ChannelTypeGuildForum {
 		creationContent["type"] = event.RoomTypeSpace
 	}
 	if !portal.bridge.Config.Bridge.FederateRooms {
@@ -559,7 +559,116 @@ func (portal *Portal) CreateMatrixRoom(user *User, channel *discordgo.Channel) e
 	go portal.forwardBackfillInitial(user, nil)
 	backfillStarted = true
 
+	if portal.Type == discordgo.ChannelTypeGuildForum {
+		go portal.backfillForumThreads(user)
+	}
+
 	return nil
+}
+
+func (portal *Portal) backfillForumThreads(user *User) {
+	if portal.MXID == "" {
+		return
+	}
+
+	activeThreads, err := user.Session.ThreadsActive(portal.Key.ChannelID)
+	if err != nil {
+		portal.log.Err(err).Msg("Failed to get active forum threads")
+	} else {
+		for _, threadMeta := range activeThreads.Threads {
+			portal.handleNewForumThread(user, threadMeta)
+		}
+	}
+
+	// NOTE: Discord API have a weird limitation on archived threads, they can only be fetched
+	//   per group of 100, so we use the before argument and a loop to fetch them all
+	archivedLimit := 100
+	var before *time.Time = nil
+	for {
+		archivedThreads, err := user.Session.ThreadsArchived(portal.Key.ChannelID, before, archivedLimit)
+		if err != nil {
+			portal.log.Err(err).Msg("Failed to get archived forum threads")
+			break
+		}
+		if len(archivedThreads.Threads) == 0 {
+			break
+		}
+
+		for _, threadMeta := range archivedThreads.Threads {
+			portal.handleNewForumThread(user, threadMeta)
+		}
+
+		if !archivedThreads.HasMore {
+			break
+		}
+
+		oldestThread := archivedThreads.Threads[len(archivedThreads.Threads)-1]
+		if oldestThread.ThreadMetadata == nil {
+			portal.log.Warn().Str("thread_id", oldestThread.ID).Msg("Thread metadata is nil, stopping pagination")
+			break
+		}
+		before = &oldestThread.ThreadMetadata.ArchiveTimestamp
+		portal.log.Debug().Str("before", before.String()).Msg("Fetching next page of archived threads")
+	}
+}
+
+func (portal *Portal) handleNewForumThread(user *User, threadMeta *discordgo.Channel) {
+	portal.log.Debug().Str("thread_id", threadMeta.ID).Str("thread_name", threadMeta.Name).Msg("Processing forum thread")
+
+	if threadMeta.MessageCount == 0 {
+		portal.log.Warn().Str("thread_id", threadMeta.ID).Msg("Forum thread has no messages")
+		return
+	}
+
+	threadPortal := portal.bridge.GetPortalByID(database.NewPortalKey(threadMeta.ID, ""), discordgo.ChannelTypeGuildPublicThread)
+	if threadPortal.MXID != "" {
+		portal.log.Debug().Str("thread_id", threadMeta.ID).Str("room_id", threadPortal.MXID.String()).Msg("Thread portal already exists")
+		return
+	}
+
+	threadPortal.GuildID = portal.GuildID
+	threadPortal.Guild = portal.Guild
+	threadPortal.ParentID = portal.Key.ChannelID
+	threadPortal.Parent = portal
+
+	err := threadPortal.CreateMatrixRoom(user, threadMeta)
+	if err != nil {
+		portal.log.Err(err).Str("thread_id", threadMeta.ID).Msg("Failed to create Matrix room for forum thread")
+		return
+	}
+
+	threadPortal.updateSpace(user)
+
+	msg, err := user.Session.ChannelMessage(threadMeta.ID, threadMeta.LastMessageID)
+	if err != nil {
+		portal.log.Err(err).Str("thread_id", threadMeta.ID).Msg("Failed to get last message for thread registration")
+	} else {
+		ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+		rootMsg := portal.bridge.DB.Message.GetByDiscordID(threadPortal.Key, msg.ID)
+		if len(rootMsg) == 0 {
+			puppet := portal.bridge.GetPuppetByID(msg.Author.ID)
+			puppet.UpdateInfo(user, msg.Author, msg)
+
+			parts := portal.convertDiscordMessage(context.Background(), puppet, puppet.IntentFor(portal), msg)
+			dbParts := make([]database.MessagePart, 0, len(parts))
+			for _, part := range parts {
+				resp, err := portal.sendMatrixMessage(puppet.IntentFor(portal), part.Type, part.Content, part.Extra, ts.UnixMilli())
+				if err != nil {
+					portal.log.Err(err).Str("part_index", part.AttachmentID).Msg("Failed to send forum thread root message to Matrix")
+					continue
+				}
+				dbParts = append(dbParts, database.MessagePart{AttachmentID: part.AttachmentID, MXID: resp.EventID})
+			}
+			if len(dbParts) > 0 {
+				rootMsg = []*database.Message{portal.markMessageHandled(msg.ID, msg.Author.ID, ts, threadMeta.ID, puppet.MXID, dbParts)}
+			}
+		}
+		if len(rootMsg) > 0 {
+			portal.bridge.threadFound(context.Background(), user, rootMsg[0], threadMeta.ID, threadMeta)
+		}
+	}
+
+	portal.log.Debug().Str("thread_id", threadMeta.ID).Str("room_id", threadPortal.MXID.String()).Msg("Created Matrix room for forum thread")
 }
 
 func (portal *Portal) handleDiscordMessages(msg portalDiscordMessage) {

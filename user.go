@@ -715,6 +715,12 @@ func (user *User) eventHandler(rawEvt any) {
 		user.interactionSuccessHandler(evt)
 	case *discordgo.ThreadListSync:
 		user.threadListSyncHandler(evt)
+	case *discordgo.ThreadCreate:
+		user.threadCreateHandler(evt)
+	case *discordgo.ThreadDelete:
+		user.threadDeleteHandler(evt)
+	case *discordgo.ThreadUpdate:
+		user.threadUpdateHandler(evt)
 	case *discordgo.Event:
 		// Ignore
 	default:
@@ -1146,6 +1152,147 @@ func (user *User) threadListSyncHandler(t *discordgo.ThreadListSync) {
 			thread.Parent.ForwardBackfillMissed(user, meta.LastMessageID, thread)
 		}
 	}
+}
+
+func (user *User) threadCreateHandler(t *discordgo.ThreadCreate) {
+	log := user.log.With().
+		Str("action", "thread create").
+		Str("guild_id", t.GuildID).
+		Str("thread_id", t.ID).
+		Str("parent_id", t.ParentID).
+		Logger()
+	ctx := log.WithContext(context.Background())
+
+	parentChannel, err := user.Session.Channel(t.ParentID)
+	if err != nil {
+		log.Err(err).Msg("Failed to get parent channel")
+		return
+	}
+
+	if parentChannel.Type != discordgo.ChannelTypeGuildForum {
+		log.Debug().Msg("Thread create in non-forum channel, skipping")
+		return
+	}
+
+	if user.getGuildBridgingMode(t.GuildID) < database.GuildBridgeEverything {
+		log.Debug().Msg("Ignoring thread create in unbridged guild")
+		return
+	}
+
+	forumPortal := user.GetPortalByMeta(parentChannel)
+	if forumPortal.MXID == "" {
+		log.Debug().Msg("Forum portal not created yet, creating")
+		if err := forumPortal.CreateMatrixRoom(user, parentChannel); err != nil {
+			log.Err(err).Msg("Failed to create forum portal")
+			return
+		}
+	}
+
+	threadPortal := user.bridge.GetPortalByID(database.NewPortalKey(t.ID, ""), discordgo.ChannelTypeGuildPublicThread)
+	if threadPortal.MXID != "" {
+		log.Debug().Str("room_id", threadPortal.MXID.String()).Msg("Thread portal already exists")
+		return
+	}
+
+	threadPortal.GuildID = t.GuildID
+	threadPortal.ParentID = t.ParentID
+	threadPortal.Parent = forumPortal
+	if guild := user.bridge.GetGuildByID(t.GuildID, false); guild != nil {
+		threadPortal.Guild = guild
+	}
+
+	log.Info().Msg("Creating Matrix room for new forum thread")
+	if err := threadPortal.CreateMatrixRoom(user, t.Channel); err != nil {
+		log.Err(err).Msg("Failed to create Matrix room for forum thread")
+		return
+	}
+
+	threadPortal.updateSpace(user)
+
+	msg, err := user.Session.ChannelMessage(t.ID, t.LastMessageID)
+	if err != nil {
+		log.Err(err).Msg("Failed to get last message for thread registration")
+		return
+	}
+
+	ts, _ := discordgo.SnowflakeTimestamp(msg.ID)
+	rootMsg := user.bridge.DB.Message.GetByDiscordID(threadPortal.Key, msg.ID)
+	if len(rootMsg) == 0 {
+		puppet := user.bridge.GetPuppetByID(msg.Author.ID)
+		puppet.UpdateInfo(user, msg.Author, msg)
+
+		intent := puppet.IntentFor(threadPortal)
+		parts := threadPortal.convertDiscordMessage(ctx, puppet, intent, msg)
+		dbParts := make([]database.MessagePart, 0, len(parts))
+		for _, part := range parts {
+			resp, err := threadPortal.sendMatrixMessage(intent, part.Type, part.Content, part.Extra, ts.UnixMilli())
+			if err != nil {
+				log.Err(err).Msg("Failed to send forum thread root message to Matrix")
+				continue
+			}
+			dbParts = append(dbParts, database.MessagePart{AttachmentID: part.AttachmentID, MXID: resp.EventID})
+		}
+		if len(dbParts) > 0 {
+			rootMsg = []*database.Message{threadPortal.markMessageHandled(msg.ID, msg.Author.ID, ts, t.ID, puppet.MXID, dbParts)}
+		}
+	}
+	if len(rootMsg) > 0 {
+		user.bridge.threadFound(ctx, user, rootMsg[0], t.ID, t.Channel)
+	}
+
+	log.Info().Str("room_id", threadPortal.MXID.String()).Msg("Created Matrix room for new forum thread")
+}
+
+func (user *User) threadDeleteHandler(t *discordgo.ThreadDelete) {
+	log := user.log.With().
+		Str("action", "thread delete").
+		Str("guild_id", t.GuildID).
+		Str("thread_id", t.ID).
+		Str("parent_id", t.ParentID).
+		Logger()
+
+	threadPortal := user.bridge.GetExistingPortalByID(database.NewPortalKey(t.ID, ""))
+	if threadPortal == nil {
+		log.Debug().Msg("Ignoring thread delete event of unknown thread")
+		return
+	}
+
+	log.Info().Str("room_id", threadPortal.MXID.String()).Msg("Got thread delete event, cleaning up portal")
+	threadPortal.Delete()
+	threadPortal.cleanup(true)
+	log.Info().Msg("Completed cleaning up thread")
+}
+
+func (user *User) threadUpdateHandler(t *discordgo.ThreadUpdate) {
+	log := user.log.With().
+		Str("action", "thread update").
+		Str("guild_id", t.GuildID).
+		Str("thread_id", t.ID).
+		Str("parent_id", t.ParentID).
+		Logger()
+
+	threadPortal := user.bridge.GetExistingPortalByID(database.NewPortalKey(t.ID, ""))
+	if threadPortal == nil || threadPortal.MXID == "" {
+		log.Debug().Msg("Ignoring thread update event of unknown thread or thread without portal")
+		return
+	}
+
+	if t.Channel == nil || t.Channel.Name == "" {
+		log.Debug().Msg("Thread update has no name, skipping")
+		return
+	}
+
+	log.Info().Str("old_name", threadPortal.Name).Str("new_name", t.Channel.Name).Msg("Updating thread name")
+
+	_, err := threadPortal.MainIntent().SetRoomName(threadPortal.MXID, t.Channel.Name)
+	if err != nil {
+		log.Err(err).Msg("Failed to update thread room name")
+		return
+	}
+
+	threadPortal.Name = t.Channel.Name
+	threadPortal.Update()
+	log.Info().Msg("Thread room name updated")
 }
 
 func (user *User) channelCreateHandler(c *discordgo.ChannelCreate) {
